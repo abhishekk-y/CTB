@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.env
+
+# C++ Build
+*.o
+*.so
+*.out
+src/ui/build/
+moc_*
+.qmake.stash
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Release zips
+*.zip
+
+# Temp
+/tmp/
