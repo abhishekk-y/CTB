@@ -1,13 +1,22 @@
 """
-AI Explanation Engine
-Generates human-readable attack explanations.
+AI Explanation Engine with ML Ensemble
+Generates human-readable attack explanations + outlier detection.
 Supports: Google Gemini (default), OpenAI, Ollama (local), or rule-based fallback.
+ML Models: Isolation Forest (outlier detection), LSTM, GNN, BERT (coming soon)
 """
 import os
 import json
 import httpx
-from typing import List, Dict, Optional
+import numpy as np
+from typing import List, Dict, Optional, Tuple
 from dotenv import load_dotenv
+
+try:
+    from sklearn.ensemble import IsolationForest
+    from sklearn.preprocessing import StandardScaler
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
 
 load_dotenv()
 
@@ -17,36 +26,162 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 AI_MODEL = os.getenv("AI_MODEL", "auto")  # "gemini", "openai", "ollama", "auto", "none"
 
 
+# ============================================================================
+# ISOLATION FOREST OUTLIER DETECTION
+# ============================================================================
+
+def extract_numeric_features(events: List[Dict]) -> Tuple[np.ndarray, List[Dict], List[str]]:
+    """
+    Extract numeric features from events for Isolation Forest analysis.
+    Features: failed_login_count, external_ip_count, process_anomaly_score,
+              port_scan_indicators, privilege_escalation_score, etc.
+    Returns: (feature_matrix, events_with_features, feature_names)
+    """
+    features_list = []
+    feature_names = ["failed_logins", "external_ips", "process_anomaly",
+                     "port_scans", "privesc_score", "outbound_external",
+                     "recon_commands", "severity_sum"]
+
+    for event in events:
+        features = {
+            "failed_logins": 1 if event.get("detection_rule") in ("brute_force", "failed_login") else 0,
+            "external_ips": 1 if event.get("detection_rule") == "external_login" else 0,
+            "process_anomaly": 1 if event.get("detection_rule") in ("suspicious_process", "known_suspicious_binary") else 0,
+            "port_scans": 1 if event.get("detection_rule") == "port_scan" else 0,
+            "privesc_score": 1 if event.get("detection_rule") == "privilege_escalation" else 0,
+            "outbound_external": 1 if event.get("detection_rule") == "outbound_external" else 0,
+            "recon_commands": 1 if event.get("detection_rule") == "post_exploitation_recon" else 0,
+            "severity_sum": {"low": 1, "medium": 2, "high": 3, "critical": 4}.get(event.get("severity", "low"), 1),
+        }
+        features_list.append(features)
+
+    # Convert to numpy array
+    X = np.array([[f[name] for name in feature_names] for f in features_list], dtype=np.float32)
+
+    return X, events, feature_names
+
+
+def detect_outliers_isolation_forest(events: List[Dict], contamination: float = 0.1) -> Dict:
+    """
+    Detect outlier/anomalous events using Isolation Forest algorithm.
+    
+    Isolation Forest:
+    - Works well with high-dimensional data
+    - Effective at detecting global and local outliers
+    - Good for cybersecurity anomaly detection
+    - Returns anomaly scores (-1 for outliers, 1 for normal)
+    
+    Args:
+        events: List of log events
+        contamination: Expected proportion of outliers (default 0.1 = 10%)
+    
+    Returns:
+        Dictionary with detection results, outlier indices, and anomaly scores
+    """
+    if not HAS_SKLEARN:
+        return {
+            "status": "error",
+            "message": "scikit-learn not installed. Install with: pip install scikit-learn",
+            "outliers": [],
+            "anomaly_scores": [],
+        }
+
+    if len(events) < 3:
+        return {
+            "status": "insufficient_data",
+            "message": f"Need at least 3 events for Isolation Forest, got {len(events)}",
+            "outliers": [],
+            "anomaly_scores": [],
+        }
+
+    # Extract features
+    X, events_list, feature_names = extract_numeric_features(events)
+
+    # Handle case where all events have no features (zeros)
+    if np.all(X == 0):
+        return {
+            "status": "no_anomalies",
+            "message": "No suspicious patterns detected in events",
+            "outliers": [],
+            "anomaly_scores": np.zeros(len(events)).tolist(),
+            "feature_names": feature_names,
+        }
+
+    # Normalize features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    # Train Isolation Forest
+    iso_forest = IsolationForest(
+        contamination=min(contamination, 0.5),
+        random_state=42,
+        n_estimators=100,
+    )
+    predictions = iso_forest.fit_predict(X_scaled)
+    anomaly_scores = iso_forest.score_samples(X_scaled)
+
+    # Normalize anomaly scores to 0-1 range (where 1 = most anomalous)
+    min_score = anomaly_scores.min()
+    max_score = anomaly_scores.max()
+    if max_score - min_score > 0:
+        normalized_scores = 1 - (anomaly_scores - min_score) / (max_score - min_score)
+    else:
+        normalized_scores = np.ones_like(anomaly_scores) * 0.5
+
+    # Identify outliers (prediction == -1)
+    outlier_indices = np.where(predictions == -1)[0].tolist()
+    outlier_events = [events[i] for i in outlier_indices]
+
+    return {
+        "status": "success",
+        "model": "isolation_forest",
+        "num_events_analyzed": len(events),
+        "num_outliers_detected": len(outlier_indices),
+        "contamination_ratio": len(outlier_indices) / len(events) if len(events) > 0 else 0,
+        "outlier_indices": outlier_indices,
+        "outliers": outlier_events,
+        "anomaly_scores": normalized_scores.tolist(),
+        "feature_names": feature_names,
+        "predictions": predictions.tolist(),
+    }
+
+
 def generate_explanation(events: List[Dict], chains: List[Dict],
-                         risk_score: float, risk_level: str) -> Dict:
+                         risk_score: float, risk_level: str,
+                         enable_isolation_forest: bool = True) -> Dict:
     """
-    Generate AI-powered explanation of the attack.
+    Generate AI-powered explanation of the attack + ML-based outlier detection.
     Priority: Gemini → OpenAI → Ollama → Rule-based
+    
+    Also runs Isolation Forest model for anomaly detection.
     """
+    # 1. Run Isolation Forest outlier detection
+    outlier_results = None
+    if enable_isolation_forest:
+        outlier_results = detect_outliers_isolation_forest(events)
+    
+    # 2. Build AI explanation context
     context = _build_context(events, chains, risk_score, risk_level)
 
     explanation = None
     model_used = "rule-based"
 
-    # 1. Try Gemini (Google AI)
+    # 3. Try AI models for explanation
     if AI_MODEL in ("gemini", "auto") and GEMINI_API_KEY:
         explanation = _call_gemini(context)
         if explanation:
             model_used = "gemini"
 
-    # 2. Try OpenAI
     if not explanation and AI_MODEL in ("openai", "auto") and OPENAI_API_KEY:
         explanation = _call_openai(context)
         if explanation:
             model_used = "openai"
 
-    # 3. Try Ollama (local)
     if not explanation and AI_MODEL in ("ollama", "auto"):
         explanation = _call_ollama(context)
         if explanation:
             model_used = "ollama"
 
-    # 4. Fallback to rule-based
     if not explanation:
         explanation = _rule_based_explanation(events, chains, risk_score, risk_level)
         model_used = "rule-based"
@@ -56,6 +191,7 @@ def generate_explanation(events: List[Dict], chains: List[Dict],
         "model_used": model_used,
         "risk_score": risk_score,
         "risk_level": risk_level,
+        "isolation_forest": outlier_results,
     }
 
 
