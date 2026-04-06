@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
 AI Runner — Called by C++ UI via QProcess
-Reads events from /tmp/logsentinel_events.json, runs ML ensemble,
-generates AI-powered attack explanation, outputs structured JSON report to stdout.
+Reads events from /tmp/logsentinel_events.json, runs complete ML ensemble pipeline,
+generates AI-powered attack explanation + kill chain narrative, outputs JSON report to stdout.
 
-ML Models in Ensemble:
-- Isolation Forest: Global outlier/anomaly detection
-- LSTM: Temporal sequence pattern analysis
-- GNN: Entity relationship graph analysis
+Complete ML Ensemble (7 Models):
+1. Isolation Forest: Global outlier detection
+2. LSTM: Temporal sequence pattern analysis
+3. GNN: Entity relationship graph analysis
+4. BERT: Semantic log similarity
+5. Ensemble Combiner: Unified threat score (0.0-1.0)
+6. MITRE Tagger: ATT&CK technique ID mapping
+7. Kill-chain Builder: Attack narrative construction
 """
 import sys
 import json
@@ -17,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from core.ai_explainer import generate_explanation
 
 def main():
-    """Main entry point for AI analysis pipeline with ML ensemble."""
+    """Main entry point for complete AI analysis pipeline with ML ensemble."""
     risk_score = float(sys.argv[1]) if len(sys.argv) > 1 else 0
     risk_level = sys.argv[2] if len(sys.argv) > 2 else "low"
     enable_ml = sys.argv[3].lower() == "true" if len(sys.argv) > 3 else True
@@ -36,7 +40,7 @@ def main():
         print(json.dumps(error_output, indent=2))
         sys.exit(1)
 
-    # Generate comprehensive analysis with ML ensemble
+    # Generate comprehensive analysis with complete ML ensemble
     result = generate_explanation(
         events,
         chains=[],
@@ -45,6 +49,9 @@ def main():
         enable_isolation_forest=enable_ml,
         enable_lstm=enable_ml,
         enable_gnn=enable_ml,
+        enable_bert=enable_ml,
+        enable_mitre=enable_ml,
+        enable_kill_chain=enable_ml,
     )
 
     # Prepare structured output
@@ -62,5 +69,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 

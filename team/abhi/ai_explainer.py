@@ -33,6 +33,13 @@ try:
 except ImportError:
     HAS_NETWORKX = False
 
+try:
+    from transformers import AutoTokenizer, AutoModel
+    import torch
+    HAS_TRANSFORMERS = True
+except ImportError:
+    HAS_TRANSFORMERS = False
+
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -501,19 +508,448 @@ def detect_graph_anomalies_gnn(events: List[Dict]) -> Dict:
         }
 
 
+# ============================================================================
+# BERT SEMANTIC EMBEDDINGS FOR LOG SIMILARITY
+# ============================================================================
+
+def compute_bert_embeddings(events: List[Dict]) -> Dict:
+    """
+    Compute BERT semantic embeddings for log events.
+    
+    BERT (Bidirectional Encoder Representations from Transformers):
+    - Converts event descriptions to semantic embeddings
+    - Enables similarity search and clustering
+    - Useful for finding similar attack patterns
+    
+    Args:
+        events: List of security events
+    
+    Returns:
+        Dictionary with embeddings and similarity analysis
+    """
+    if not HAS_TRANSFORMERS:
+        return {
+            "status": "error",
+            "message": "transformers package not installed. Install with: pip install transformers torch",
+            "embeddings": [],
+            "similar_events": [],
+        }
+
+    try:
+        # Use lightweight BERT model
+        model_name = "sentence-transformers/all-MiniLM-L6-v2"
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name)
+
+        embeddings = []
+        descriptions = []
+
+        # Create event descriptions
+        for event in events:
+            desc = f"{event.get('action', '')} {event.get('detection_rule', '')} {event.get('user', '')} {event.get('process', '')}"
+            descriptions.append(desc)
+
+        # Tokenize and encode
+        with torch.no_grad():
+            encoded = tokenizer(descriptions, padding=True, truncation=True, return_tensors='pt')
+            outputs = model(**encoded)
+            embeddings = outputs.last_hidden_state.mean(dim=1).numpy()
+
+        # Normalize embeddings
+        embeddings = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8)
+
+        # Find similar event pairs (cosine similarity > 0.7)
+        similar_events = []
+        for i in range(len(embeddings)):
+            for j in range(i + 1, len(embeddings)):
+                similarity = np.dot(embeddings[i], embeddings[j])
+                if similarity > 0.7:
+                    similar_events.append({
+                        "event1_idx": i,
+                        "event2_idx": j,
+                        "similarity": float(similarity),
+                        "description": f"{descriptions[i][:50]} ~ {descriptions[j][:50]}",
+                    })
+
+        return {
+            "status": "success",
+            "model": "bert_embeddings",
+            "num_events_embedded": len(embeddings),
+            "num_similar_pairs": len(similar_events),
+            "embeddings": embeddings.tolist(),
+            "similar_events": similar_events[:10],  # Top 10
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"BERT embedding failed: {str(e)}",
+            "embeddings": [],
+            "similar_events": [],
+        }
+
+
+# ============================================================================
+# WEIGHTED ENSEMBLE COMBINER → UNIFIED THREAT SCORE (0.0-1.0)
+# ============================================================================
+
+def compute_ensemble_threat_score(isolation_forest_result: Optional[Dict],
+                                  lstm_result: Optional[Dict],
+                                  gnn_result: Optional[Dict],
+                                  base_risk_score: float) -> Dict:
+    """
+    Combine all ML model outputs into a unified threat score (0.0-1.0).
+    
+    Weighted Ensemble:
+    - Isolation Forest (30%): Global outlier anomaly score
+    - LSTM (30%): Temporal sequence deviation
+    - GNN (25%): Entity relationship graph anomalies
+    - Base Risk Score (15%): Human-rated baseline
+    
+    Args:
+        isolation_forest_result: Output from Isolation Forest model
+        lstm_result: Output from LSTM model
+        gnn_result: Output from GNN model
+        base_risk_score: Original risk score (0-100)
+    
+    Returns:
+        Dictionary with ensemble threat score & model contributions
+    """
+    scores = []
+    weights = []
+    model_contributions = {}
+
+    # 1. Isolation Forest contribution (30%)
+    if isolation_forest_result and isolation_forest_result.get("status") == "success":
+        anomaly_scores = isolation_forest_result.get("anomaly_scores", [])
+        if anomaly_scores:
+            iso_score = float(np.mean(anomaly_scores))
+            scores.append(iso_score)
+            weights.append(0.30)
+            model_contributions["isolation_forest"] = {
+                "score": iso_score,
+                "weight": 0.30,
+            }
+
+    # 2. LSTM contribution (30%)
+    if lstm_result and lstm_result.get("status") == "success":
+        sequence_scores = lstm_result.get("sequence_anomaly_scores", [])
+        if sequence_scores:
+            lstm_score = float(np.mean(sequence_scores))
+            scores.append(lstm_score)
+            weights.append(0.30)
+            model_contributions["lstm"] = {
+                "score": lstm_score,
+                "weight": 0.30,
+            }
+
+    # 3. GNN contribution (25%)
+    if gnn_result and gnn_result.get("status") == "success":
+        num_anomalies = gnn_result.get("num_anomalies_detected", 0)
+        gnn_score = min(num_anomalies * 0.2, 1.0)  # Scale to 0-1
+        scores.append(gnn_score)
+        weights.append(0.25)
+        model_contributions["gnn"] = {
+            "score": gnn_score,
+            "weight": 0.25,
+        }
+
+    # 4. Base risk score contribution (15%)
+    base_normalized = (base_risk_score / 100.0)
+    scores.append(base_normalized)
+    weights.append(0.15)
+    model_contributions["base_risk"] = {
+        "score": base_normalized,
+        "weight": 0.15,
+    }
+
+    # Compute weighted average
+    if scores:
+        threat_score = float(np.average(scores, weights=weights[:len(scores)]))
+    else:
+        threat_score = base_normalized
+
+    # Clamp to 0-1
+    threat_score = max(0.0, min(1.0, threat_score))
+
+    # Determine threat level
+    if threat_score >= 0.8:
+        threat_level = "critical"
+    elif threat_score >= 0.6:
+        threat_level = "high"
+    elif threat_score >= 0.4:
+        threat_level = "medium"
+    elif threat_score >= 0.2:
+        threat_level = "low"
+    else:
+        threat_level = "minimal"
+
+    return {
+        "status": "success",
+        "unified_threat_score": threat_score,
+        "threat_level": threat_level,
+        "model_contributions": model_contributions,
+        "ensemble_confidence": len(scores) / 4.0,  # How many models contributed
+    }
+
+
+# ============================================================================
+# MITRE ATT&CK AUTO-TAGGER WITH TECHNIQUE ID MAPPING
+# ============================================================================
+
+MITRE_MAPPING = {
+    "brute_force": "T1110",
+    "failed_login": "T1110.001",
+    "external_login": "T1133",
+    "privilege_escalation": "T1548",
+    "suspicious_process": "T1059",
+    "known_suspicious_binary": "T1071",
+    "outbound_external": "T1041",
+    "post_exploitation_recon": "T1087",
+    "port_scan": "T1046",
+    "lateral_movement": "T1570",
+    "persistence": "T1547",
+    "defense_evasion": "T1548",
+    "credential_access": "T1110",
+    "discovery": "T1087",
+    "execution": "T1059",
+    "exfiltration": "T1041",
+}
+
+MITRE_TACTIC_MAPPING = {
+    "T1110": "Initial Access / Credential Access",
+    "T1110.001": "Credential Access",
+    "T1133": "Initial Access",
+    "T1548": "Privilege Escalation / Defense Evasion",
+    "T1059": "Execution",
+    "T1071": "Command & Control",
+    "T1041": "Exfiltration",
+    "T1087": "Discovery",
+    "T1046": "Discovery",
+    "T1570": "Lateral Movement",
+    "T1547": "Persistence",
+}
+
+
+def tag_mitre_techniques(events: List[Dict]) -> Dict:
+    """
+    Automatically tag events with MITRE ATT&CK technique IDs.
+    
+    MITRE ATT&CK Framework:
+    - Maps observed behaviors to standardized techniques
+    - Enables threat intelligence correlation
+    - Facilitates incident response playbooks
+    
+    Args:
+        events: List of security events
+    
+    Returns:
+        Dictionary with MITRE technique tags and counts
+    """
+    techniques = {}
+    tactics = {}
+    event_mappings = []
+
+    for event_idx, event in enumerate(events):
+        rule = event.get("detection_rule", "")
+        matched_techniques = []
+
+        # Match detection rule to MITRE technique
+        if rule in MITRE_MAPPING:
+            tech_id = MITRE_MAPPING[rule]
+            matched_techniques.append(tech_id)
+
+            if tech_id not in techniques:
+                techniques[tech_id] = {"count": 0, "events": []}
+            techniques[tech_id]["count"] += 1
+            techniques[tech_id]["events"].append(event_idx)
+
+            # Map to tactic
+            tactic = MITRE_TACTIC_MAPPING.get(tech_id, "Unknown")
+            if tactic not in tactics:
+                tactics[tactic] = [tech_id]
+            if tech_id not in tactics[tactic]:
+                tactics[tactic].append(tech_id)
+
+        # Multi-rule detection for complex attacks
+        if event.get("severity") in ("high", "critical"):
+            if rule in ("privilege_escalation", "suspicious_process"):
+                if "T1548" not in matched_techniques:
+                    matched_techniques.append("T1548")
+            if rule in ("outbound_external", "external_login"):
+                if "T1041" not in matched_techniques:
+                    matched_techniques.append("T1041")
+
+        event_mappings.append({
+            "event_idx": event_idx,
+            "detection_rule": rule,
+            "matched_techniques": matched_techniques,
+        })
+
+    return {
+        "status": "success",
+        "model": "mitre_tagger",
+        "num_events_tagged": len(events),
+        "num_unique_techniques": len(techniques),
+        "techniques": techniques,
+        "tactics": tactics,
+        "event_mappings": event_mappings,
+    }
+
+
+# ============================================================================
+# KILL-CHAIN BUILDER — ATTACK NARRATIVE CONSTRUCTION
+# ============================================================================
+
+def build_kill_chain(events: List[Dict], gnn_result: Optional[Dict],
+                     mitre_result: Optional[Dict]) -> Dict:
+    """
+    Build attack kill-chain narrative from events and analysis results.
+    
+    Kill Chain Phases (Lockheed Martin):
+    1. Reconnaissance — Attacker gathers info
+    2. Weaponization — Prepare attack payload
+    3. Delivery — Transmit payload
+    4. Exploitation — Trigger vulnerability
+    5. Installation — Establish persistence
+    6. Command & Control — Remote access
+    7. Actions on Objectives — Accomplish goal (data theft, destruction, etc.)
+    
+    Args:
+        events: Ordered security events
+        gnn_result: Entity graph analysis results
+        mitre_result: MITRE technique tags
+    
+    Returns:
+        Dictionary with kill-chain phases, narrative, and timeline
+    """
+    kill_chain = {
+        "reconnaissance": {"events": [], "indicators": []},
+        "weaponization": {"events": [], "indicators": []},
+        "delivery": {"events": [], "indicators": []},
+        "exploitation": {"events": [], "indicators": []},
+        "installation": {"events": [], "indicators": []},
+        "command_control": {"events": [], "indicators": []},
+        "actions_on_objectives": {"events": [], "indicators": []},
+    }
+
+    for idx, event in enumerate(events):
+        rule = event.get("detection_rule", "")
+        severity = event.get("severity", "low")
+
+        # Phase 1: Reconnaissance
+        if rule in ("port_scan", "post_exploitation_recon"):
+            kill_chain["reconnaissance"]["events"].append(idx)
+            kill_chain["reconnaissance"]["indicators"].append(
+                f"Reconnaissance: {event.get('action', 'unknown')}"
+            )
+
+        # Phase 2: Weaponization (often not observable in logs)
+        if rule == "known_suspicious_binary":
+            kill_chain["weaponization"]["events"].append(idx)
+            kill_chain["weaponization"]["indicators"].append(
+                f"Suspicious binary detected: {event.get('process', 'unknown')}"
+            )
+
+        # Phase 3: Delivery
+        if rule in ("external_login", "outbound_external"):
+            kill_chain["delivery"]["events"].append(idx)
+            kill_chain["delivery"]["indicators"].append(
+                f"External delivery: {event.get('ip_address', 'unknown')}"
+            )
+
+        # Phase 4: Exploitation
+        if rule in ("suspicious_process", "privilege_escalation"):
+            kill_chain["exploitation"]["events"].append(idx)
+            kill_chain["exploitation"]["indicators"].append(
+                f"Exploitation attempt: {event.get('process', 'unknown')}"
+            )
+
+        # Phase 5: Installation
+        if rule == "privilege_escalation" or (rule == "suspicious_process" and severity in ("high", "critical")):
+            kill_chain["installation"]["events"].append(idx)
+            kill_chain["installation"]["indicators"].append(
+                f"Persistence mechanism: {event.get('process', 'unknown')}"
+            )
+
+        # Phase 6: Command & Control
+        if rule in ("outbound_external", "brute_force"):
+            kill_chain["command_control"]["events"].append(idx)
+            kill_chain["command_control"]["indicators"].append(
+                f"C2 communication: {event.get('ip_address', 'unknown')}"
+            )
+
+        # Phase 7: Actions on Objectives
+        if rule == "outbound_external" or (rule in ("external_login", "privilege_escalation") and severity == "critical"):
+            kill_chain["actions_on_objectives"]["events"].append(idx)
+            kill_chain["actions_on_objectives"]["indicators"].append(
+                f"Data exfiltration/impact: {event.get('action', 'unknown')}"
+            )
+
+    # Build narrative
+    narrative_parts = ["## 🔗 Attack Kill Chain Narrative\n"]
+
+    phases_order = [
+        ("reconnaissance", "Reconnaissance — Attacker Gathers Intelligence"),
+        ("weaponization", "Weaponization — Payload Preparation"),
+        ("delivery", "Delivery — Initial Access"),
+        ("exploitation", "Exploitation — Vulnerability Trigger"),
+        ("installation", "Installation — Persistence Establishment"),
+        ("command_control", "Command & Control — Remote Access"),
+        ("actions_on_objectives", "Actions on Objectives — Goal Accomplishment"),
+    ]
+
+    active_phases = []
+    for phase_key, phase_name in phases_order:
+        phase_data = kill_chain[phase_key]
+        if phase_data["events"]:
+            active_phases.append(phase_key)
+            narrative_parts.append(f"\n### {phase_name}")
+            narrative_parts.append(f"**Events:** {len(phase_data['events'])}")
+            for indicator in phase_data["indicators"][:3]:  # Top 3 per phase
+                narrative_parts.append(f"- {indicator}")
+
+    narrative = "\n".join(narrative_parts)
+
+    # Calculate attack progression
+    progression = []
+    for phase_key, _ in phases_order:
+        if kill_chain[phase_key]["events"]:
+            progression.append(phase_key)
+
+    return {
+        "status": "success",
+        "model": "kill_chain_builder",
+        "num_events_analyzed": len(events),
+        "active_phases": active_phases,
+        "phase_progression": progression,
+        "kill_chain": kill_chain,
+        "narrative": narrative,
+        "estimated_sophistication": len(active_phases) / 7.0,  # 0-1
+    }
+
+
 def generate_explanation(events: List[Dict], chains: List[Dict],
                          risk_score: float, risk_level: str,
                          enable_isolation_forest: bool = True,
                          enable_lstm: bool = True,
-                         enable_gnn: bool = True) -> Dict:
+                         enable_gnn: bool = True,
+                         enable_bert: bool = True,
+                         enable_mitre: bool = True,
+                         enable_kill_chain: bool = True) -> Dict:
     """
-    Generate AI-powered explanation + run ML ensemble (Isolation Forest, LSTM, GNN).
-    Priority: Gemini → OpenAI → Ollama → Rule-based
+    Generate AI-powered explanation + complete ML ensemble pipeline.
     
-    ML Models:
-    - Isolation Forest: Global outlier detection
-    - LSTM: Temporal sequence anomalies
-    - GNN: Entity relationship graph analysis
+    ML Models (All 7):
+    1. Isolation Forest: Global outlier detection
+    2. LSTM: Temporal sequence anomalies
+    3. GNN: Entity relationship graph analysis
+    4. BERT: Semantic log similarity
+    5. Ensemble Combiner: Unified threat score (0.0-1.0)
+    6. MITRE Tagger: ATT&CK technique mapping
+    7. Kill-chain Builder: Attack narrative construction
+    
+    Priority AI: Gemini → OpenAI → Ollama → Rule-based
     """
     # 1. Run Isolation Forest outlier detection
     outlier_results = None
@@ -530,13 +966,33 @@ def generate_explanation(events: List[Dict], chains: List[Dict],
     if enable_gnn and HAS_NETWORKX:
         gnn_results = detect_graph_anomalies_gnn(events)
     
-    # 4. Build AI explanation context
+    # 4. Compute BERT semantic embeddings
+    bert_results = None
+    if enable_bert and HAS_TRANSFORMERS:
+        bert_results = compute_bert_embeddings(events)
+    
+    # 5. Build MITRE ATT&CK tags
+    mitre_results = None
+    if enable_mitre:
+        mitre_results = tag_mitre_techniques(events)
+    
+    # 6. Build kill-chain narrative
+    kill_chain_results = None
+    if enable_kill_chain:
+        kill_chain_results = build_kill_chain(events, gnn_results, mitre_results)
+    
+    # 7. Compute ensemble threat score
+    ensemble_results = compute_ensemble_threat_score(
+        outlier_results, lstm_results, gnn_results, risk_score
+    )
+    
+    # 8. Build AI explanation context
     context = _build_context(events, chains, risk_score, risk_level)
 
     explanation = None
     model_used = "rule-based"
 
-    # 5. Try AI models for explanation
+    # 9. Try AI models for explanation
     if AI_MODEL in ("gemini", "auto") and GEMINI_API_KEY:
         explanation = _call_gemini(context)
         if explanation:
@@ -565,6 +1021,10 @@ def generate_explanation(events: List[Dict], chains: List[Dict],
             "isolation_forest": outlier_results,
             "lstm": lstm_results,
             "gnn": gnn_results,
+            "bert": bert_results,
+            "mitre_tagger": mitre_results,
+            "kill_chain": kill_chain_results,
+            "ensemble_threat_score": ensemble_results,
         },
     }
 
