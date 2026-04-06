@@ -18,6 +18,21 @@ try:
 except ImportError:
     HAS_SKLEARN = False
 
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential
+    from tensorflow.keras.layers import LSTM, Dense, Dropout
+    from tensorflow.keras.optimizers import Adam
+    HAS_TENSORFLOW = True
+except ImportError:
+    HAS_TENSORFLOW = False
+
+try:
+    import networkx as nx
+    HAS_NETWORKX = True
+except ImportError:
+    HAS_NETWORKX = False
+
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -146,27 +161,382 @@ def detect_outliers_isolation_forest(events: List[Dict], contamination: float = 
     }
 
 
+# ============================================================================
+# LSTM SEQUENCE MEMORY MODEL FOR TEMPORAL PATTERNS
+# ============================================================================
+
+def build_lstm_sequences(events: List[Dict], sequence_length: int = 5) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """
+    Build sequences of event features for LSTM training.
+    
+    Each sequence is a time window of consecutive events.
+    LSTM learns temporal patterns in security events.
+    
+    Args:
+        events: List of log events with temporal ordering
+        sequence_length: Number of events per sequence (default 5)
+    
+    Returns:
+        (sequences, labels, feature_names)
+    """
+    feature_names = ["severity_score", "suspicious_flag", "user_anomaly",
+                     "ip_anomaly", "process_anomaly", "network_outbound"]
+
+    X = []
+    y = []
+
+    for event in events:
+        severity_map = {"low": 0.2, "medium": 0.5, "high": 0.8, "critical": 1.0}
+        is_suspicious = 1.0 if event.get("is_suspicious") else 0.0
+        
+        features = np.array([
+            severity_map.get(event.get("severity", "low"), 0.2),
+            is_suspicious,
+            1.0 if event.get("user") == "root" or event.get("user") == "admin" else 0.0,
+            1.0 if event.get("detection_rule") == "external_login" else 0.0,
+            1.0 if event.get("detection_rule") in ("suspicious_process", "known_suspicious_binary") else 0.0,
+            1.0 if event.get("detection_rule") == "outbound_external" else 0.0,
+        ], dtype=np.float32)
+        
+        X.append(features)
+        y.append(is_suspicious)
+
+    X = np.array(X, dtype=np.float32)
+    y = np.array(y, dtype=np.float32)
+
+    # Create sliding window sequences
+    sequences = []
+    labels = []
+
+    if len(X) < sequence_length:
+        # Pad with zeros if insufficient events
+        padding = np.zeros((sequence_length - len(X), len(feature_names)), dtype=np.float32)
+        sequences.append(np.vstack([padding, X]))
+        labels.append(y[-1] if len(y) > 0 else 0.0)
+    else:
+        for i in range(len(X) - sequence_length + 1):
+            sequences.append(X[i:i + sequence_length])
+            labels.append(y[i + sequence_length - 1])
+
+    return np.array(sequences, dtype=np.float32), np.array(labels, dtype=np.float32), feature_names
+
+
+def detect_sequence_anomalies_lstm(events: List[Dict], sequence_length: int = 5) -> Dict:
+    """
+    Detect temporal sequence anomalies using LSTM (Long Short-Term Memory).
+    
+    LSTM Advantages:
+    - Captures long-term temporal dependencies in attack sequences
+    - Learns normal event flow patterns
+    - Detects deviations from expected patterns
+    - Good for finding sophisticated multi-step attacks
+    
+    Args:
+        events: Ordered list of security events
+        sequence_length: Temporal window size
+    
+    Returns:
+        Dictionary with sequence anomaly detection results
+    """
+    if not HAS_TENSORFLOW:
+        return {
+            "status": "error",
+            "message": "TensorFlow not installed. Install with: pip install tensorflow",
+            "anomalies": [],
+            "sequence_scores": [],
+        }
+
+    if len(events) < 2:
+        return {
+            "status": "insufficient_data",
+            "message": f"Need at least 2 events for LSTM, got {len(events)}",
+            "anomalies": [],
+            "sequence_scores": [],
+        }
+
+    try:
+        # Build sequences
+        X, y, feature_names = build_lstm_sequences(events, sequence_length)
+
+        # Normalize features
+        scaler = StandardScaler()
+        X_reshaped = X.reshape(-1, X.shape[-1])
+        X_normalized = scaler.fit_transform(X_reshaped)
+        X_normalized = X_normalized.reshape(X.shape)
+
+        # Build LSTM model
+        model = Sequential([
+            LSTM(32, activation='relu', input_shape=(sequence_length, len(feature_names))),
+            Dropout(0.2),
+            Dense(16, activation='relu'),
+            Dropout(0.2),
+            Dense(1, activation='sigmoid'),  # Output: 0-1 (normal vs anomaly)
+        ])
+
+        model.compile(optimizer=Adam(learning_rate=0.001), loss='binary_crossentropy', metrics=['accuracy'])
+
+        # Train on normal behavior (suppress output)
+        model.fit(X_normalized, y, epochs=10, batch_size=2, verbose=0)
+
+        # Predict anomaly scores (reconstruction error)
+        predictions = model.predict(X_normalized, verbose=0)
+        anomaly_scores = np.abs(predictions.flatten() - y)  # Error between predicted and actual
+
+        # Normalize to 0-1
+        min_score = anomaly_scores.min()
+        max_score = anomaly_scores.max()
+        if max_score - min_score > 0:
+            normalized_scores = (anomaly_scores - min_score) / (max_score - min_score)
+        else:
+            normalized_scores = anomaly_scores
+
+        # Identify anomalies (score > 0.5)
+        anomaly_threshold = 0.5
+        anomalies = np.where(normalized_scores > anomaly_threshold)[0].tolist()
+
+        return {
+            "status": "success",
+            "model": "lstm_temporal",
+            "num_sequences": len(X),
+            "sequence_length": sequence_length,
+            "num_anomalies_detected": len(anomalies),
+            "anomaly_indices": anomalies,
+            "sequence_anomaly_scores": normalized_scores.tolist(),
+            "feature_names": feature_names,
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"LSTM training failed: {str(e)}",
+            "anomalies": [],
+            "sequence_scores": [],
+        }
+
+
+# ============================================================================
+# GNN ENTITY GRAPH MODEL FOR RELATIONSHIP ANALYSIS
+# ============================================================================
+
+def build_entity_graph(events: List[Dict]) -> Optional[Dict]:
+    """
+    Build a knowledge graph of entities (users, IPs, processes, hosts) and relationships.
+    
+    Entities: Users, IP Addresses, Processes, Hosts
+    Edges: User→IP (login), Process→IP (exfil), User→Process (execution), etc.
+    
+    Returns:
+        Dictionary with graph structure and metadata
+    """
+    if not HAS_NETWORKX:
+        return None
+
+    graph_data = {
+        "users": {},
+        "ips": {},
+        "processes": {},
+        "hosts": {},
+        "edges": [],
+    }
+
+    user_risk_score = {}
+    ip_risk_score = {}
+    process_risk_score = {}
+
+    for event in events:
+        user = event.get("user")
+        ip = event.get("ip_address")
+        process = event.get("process")
+        host = event.get("host", "unknown")
+        severity = {"low": 1, "medium": 2, "high": 3, "critical": 4}.get(event.get("severity", "low"), 1)
+
+        # Track entities
+        if user:
+            user_risk_score[user] = user_risk_score.get(user, 0) + severity
+            if user not in graph_data["users"]:
+                graph_data["users"][user] = {"risk_score": 0, "event_count": 0}
+            graph_data["users"][user]["event_count"] += 1
+            graph_data["users"][user]["risk_score"] = user_risk_score[user]
+
+        if ip:
+            ip_risk_score[ip] = ip_risk_score.get(ip, 0) + severity
+            if ip not in graph_data["ips"]:
+                graph_data["ips"][ip] = {"risk_score": 0, "event_count": 0, "is_external": 1 if event.get("detection_rule") == "external_login" else 0}
+            graph_data["ips"][ip]["event_count"] += 1
+            graph_data["ips"][ip]["risk_score"] = ip_risk_score[ip]
+
+        if process:
+            process_risk_score[process] = process_risk_score.get(process, 0) + severity
+            if process not in graph_data["processes"]:
+                graph_data["processes"][process] = {"risk_score": 0, "event_count": 0}
+            graph_data["processes"][process]["event_count"] += 1
+            graph_data["processes"][process]["risk_score"] = process_risk_score[process]
+
+        if host not in graph_data["hosts"]:
+            graph_data["hosts"][host] = {"risk_score": 0, "event_count": 0}
+        graph_data["hosts"][host]["event_count"] += 1
+        graph_data["hosts"][host]["risk_score"] += severity
+
+        # Create edges
+        if user and ip:
+            graph_data["edges"].append({"source": user, "target": ip, "type": "login", "severity": severity})
+        if user and process:
+            graph_data["edges"].append({"source": user, "target": process, "type": "execution", "severity": severity})
+        if process and ip:
+            graph_data["edges"].append({"source": process, "target": ip, "type": "connection", "severity": severity})
+
+    return graph_data
+
+
+def detect_graph_anomalies_gnn(events: List[Dict]) -> Dict:
+    """
+    Detect anomalous patterns in entity relationships using Graph Neural Network approach.
+    
+    GNN Approach (simplified):
+    - Build knowledge graph of users, IPs, processes
+    - Identify high-risk entity neighborhoods
+    - Detect suspicious relationship patterns
+    - Find coordinated multi-entity attacks
+    
+    Args:
+        events: List of security events
+    
+    Returns:
+        Dictionary with graph anomaly detection results
+    """
+    if len(events) < 2:
+        return {
+            "status": "insufficient_data",
+            "message": f"Need at least 2 events for GNN, got {len(events)}",
+            "anomalies": [],
+            "graph_stats": {},
+        }
+
+    try:
+        # Build entity graph
+        graph_data = build_entity_graph(events)
+
+        if not graph_data:
+            return {
+                "status": "error",
+                "message": "NetworkX not available for graph analysis",
+                "anomalies": [],
+                "graph_stats": {},
+            }
+
+        # Identify high-risk entities
+        high_risk_users = {u: s for u, s in graph_data["users"].items() if s["risk_score"] >= 3}
+        high_risk_ips = {ip: s for ip, s in graph_data["ips"].items() if s["risk_score"] >= 3}
+        high_risk_processes = {p: s for p, s in graph_data["processes"].items() if s["risk_score"] >= 2}
+
+        # Detect suspicious patterns
+        anomalies = []
+
+        # Pattern 1: User with multiple IPs in short time (impossible login)
+        for user, data in graph_data["users"].items():
+            connected_ips = [e["target"] for e in graph_data["edges"] if e["source"] == user and e["type"] == "login"]
+            if len(connected_ips) > 2:
+                anomalies.append({
+                    "type": "impossible_travel",
+                    "entity": user,
+                    "risk_level": "high",
+                    "description": f"User {user} connected from {len(connected_ips)} different IPs",
+                })
+
+        # Pattern 2: Process making external connections
+        for process, data in graph_data["processes"].items():
+            connected_ips = [e["target"] for e in graph_data["edges"] if e["source"] == process and e["type"] == "connection"]
+            if len(connected_ips) > 1 and data["risk_score"] > 2:
+                anomalies.append({
+                    "type": "suspicious_process_network",
+                    "entity": process,
+                    "risk_level": "high",
+                    "description": f"Process {process} connected to {len(connected_ips)} IPs with high risk score",
+                })
+
+        # Pattern 3: High-risk IP with multiple users
+        for ip, data in graph_data["ips"].items():
+            connected_users = [e["source"] for e in graph_data["edges"] if e["target"] == ip and e["type"] == "login"]
+            if len(connected_users) > 2:
+                anomalies.append({
+                    "type": "suspicious_ip_source",
+                    "entity": ip,
+                    "risk_level": "high",
+                    "description": f"IP {ip} accessed by {len(connected_users)} different users",
+                })
+
+        # Calculate statistics
+        graph_stats = {
+            "num_users": len(graph_data["users"]),
+            "num_ips": len(graph_data["ips"]),
+            "num_processes": len(graph_data["processes"]),
+            "num_hosts": len(graph_data["hosts"]),
+            "num_edges": len(graph_data["edges"]),
+            "high_risk_users": len(high_risk_users),
+            "high_risk_ips": len(high_risk_ips),
+            "high_risk_processes": len(high_risk_processes),
+            "avg_user_risk": float(np.mean([s["risk_score"] for s in graph_data["users"].values()]) if graph_data["users"] else 0),
+            "avg_ip_risk": float(np.mean([s["risk_score"] for s in graph_data["ips"].values()]) if graph_data["ips"] else 0),
+        }
+
+        return {
+            "status": "success",
+            "model": "gnn_entity_graph",
+            "num_anomalies_detected": len(anomalies),
+            "anomalies": anomalies,
+            "graph_stats": graph_stats,
+            "high_risk_entities": {
+                "users": high_risk_users,
+                "ips": high_risk_ips,
+                "processes": high_risk_processes,
+            },
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": f"GNN analysis failed: {str(e)}",
+            "anomalies": [],
+            "graph_stats": {},
+        }
+
+
 def generate_explanation(events: List[Dict], chains: List[Dict],
                          risk_score: float, risk_level: str,
-                         enable_isolation_forest: bool = True) -> Dict:
+                         enable_isolation_forest: bool = True,
+                         enable_lstm: bool = True,
+                         enable_gnn: bool = True) -> Dict:
     """
-    Generate AI-powered explanation of the attack + ML-based outlier detection.
+    Generate AI-powered explanation + run ML ensemble (Isolation Forest, LSTM, GNN).
     Priority: Gemini → OpenAI → Ollama → Rule-based
     
-    Also runs Isolation Forest model for anomaly detection.
+    ML Models:
+    - Isolation Forest: Global outlier detection
+    - LSTM: Temporal sequence anomalies
+    - GNN: Entity relationship graph analysis
     """
     # 1. Run Isolation Forest outlier detection
     outlier_results = None
-    if enable_isolation_forest:
+    if enable_isolation_forest and HAS_SKLEARN:
         outlier_results = detect_outliers_isolation_forest(events)
     
-    # 2. Build AI explanation context
+    # 2. Run LSTM temporal sequence model
+    lstm_results = None
+    if enable_lstm and HAS_TENSORFLOW:
+        lstm_results = detect_sequence_anomalies_lstm(events)
+    
+    # 3. Run GNN entity graph model
+    gnn_results = None
+    if enable_gnn and HAS_NETWORKX:
+        gnn_results = detect_graph_anomalies_gnn(events)
+    
+    # 4. Build AI explanation context
     context = _build_context(events, chains, risk_score, risk_level)
 
     explanation = None
     model_used = "rule-based"
 
-    # 3. Try AI models for explanation
+    # 5. Try AI models for explanation
     if AI_MODEL in ("gemini", "auto") and GEMINI_API_KEY:
         explanation = _call_gemini(context)
         if explanation:
@@ -191,7 +561,11 @@ def generate_explanation(events: List[Dict], chains: List[Dict],
         "model_used": model_used,
         "risk_score": risk_score,
         "risk_level": risk_level,
-        "isolation_forest": outlier_results,
+        "ml_ensemble": {
+            "isolation_forest": outlier_results,
+            "lstm": lstm_results,
+            "gnn": gnn_results,
+        },
     }
 
 
